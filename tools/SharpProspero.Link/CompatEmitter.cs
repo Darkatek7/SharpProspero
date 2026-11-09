@@ -610,43 +610,31 @@ public static class CompatEmitter
     // reserved range is first written to.
     //
     // The two cases need opposite calls and cannot be told apart by trying one and watching it fail, so
-    // the range is asked about first.
+    // each part of the range is asked about first: a held range with nothing behind it gets memory mapped
+    // over it, pinned to its addresses, and a range with memory behind it gets the protection change.
     //
-    // A protection change over a range that is held but empty **succeeds** and attaches nothing, so
-    // going to it first leaves the memory untaken, tells the caller the range is his, and faults on the
-    // first write. Going to the mapping call first does not separate them either: a held range already
-    // occupies the address space, so a mapping that refuses to overwrite is turned away and lands right
-    // back on the protection change. What distinguishes them is not the outcome of either call but
-    // whether anything is behind the address, and the range report says so directly.
-    private static CompatFunc MProtect(bool extraPage = false)
+    // The range the runtime passes can span several of the platform's ranges - the collector commits
+    // across what it reserved in separate calls - so the report is read for each part in turn rather
+    // than once for the start. Deciding the whole range from its first part leaves everything past that
+    // part either empty (the first write there faults) or mapped over (what it held is gone).
+    //
+    // A read-write request also puts memory behind the page right after the range when that page is
+    // held but empty: the collector reads its bookkeeping across the end of what it committed.
+    private static CompatFunc MProtect()
     {
         var a = new Asm();
         a.Emit(0x55, 0x48, 0x89, 0xE5);                     // push rbp ; mov rbp, rsp
-        a.Emit(0x48, 0x83, 0xEC, 0x70);                     // sub rsp, 112
-        // The frame holds the three arguments at [rbp-8], [rbp-16] and [rbp-24], and the range report
-        // from [rbp-0x60] up to where the arguments start.
+        a.Emit(0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00);   // sub rsp, 128
+        // Frame: [rbp-8] addr, [rbp-16] len, [rbp-24] prot, the range report from [rbp-0x60] to
+        // [rbp-0x18], [rbp-0x68] the part being handled, [rbp-0x70] the end, [rbp-0x78] the part's end.
         // A protection change covers whole pages: the address moves back to the start of its page and
-        // the length grows by as much, then rounds up. The platform's call refuses anything else, and
-        // the runtime changes protection on ranges it sized in objects rather than in pages.
+        // the length grows by as much, then rounds up.
         a.Emit(0x48, 0x89, 0xF8);                           // mov rax, rdi
         a.Emit(0x25, 0xFF, 0x3F, 0x00, 0x00);               // and eax, page - 1
         a.Emit(0x48, 0x01, 0xC6);                           // add rsi, rax
         a.Emit(0x48, 0x81, 0xE7, 0x00, 0xC0, 0xFF, 0xFF);   // and rdi, -page
         a.Emit(0x48, 0x81, 0xC6, 0xFF, 0x3F, 0x00, 0x00);   // add rsi, page - 1
         a.Emit(0x48, 0x81, 0xE6, 0x00, 0xC0, 0xFF, 0xFF);   // and rsi, -page
-        if (extraPage)
-        {
-            // The collector sizes its commit calls in objects and reads across the tail into the next
-            // page: a range whose bookkeeping is one entry sits at some byte offset in the page it starts
-            // on, and the entry itself is 168 bytes, so its last field lands past the first page. The
-            // collector does not commit the second page from a separate call -- it assumes the first
-            // commit's rounding covered it -- and if the first commit's size falls short of the second
-            // page's beginning, that page is never taken from the flexible pool and the first field read
-            // from it faults. One extra page beyond the rounded end fills that gap. This extension is for
-            // the standalone environment where the host process's address space is tighter; an application
-            // module's own collector sizes its commits in pages and the round-up is enough.
-            a.Emit(0x48, 0x81, 0xC6, 0x00, 0x40, 0x00, 0x00); // add rsi, page
-        }
         a.Emit(0x48, 0x89, 0x7D, 0xF8);                     // mov [rbp-8], rdi   (addr)
         a.Emit(0x48, 0x89, 0x75, 0xF0);                     // mov [rbp-16], rsi  (len)
 
@@ -655,58 +643,100 @@ public static class CompatEmitter
         a.Emit(0xBA, ProtReadWrite, 0x00, 0x00, 0x00);      // mov edx, read-write
         a.Mark("kept");
         a.Emit(0x89, 0x55, 0xE8);                           // mov [rbp-24], edx  (prot)
+        a.Emit(0x48, 0x89, 0x7D, 0x98);                     // mov [rbp-0x68], rdi  (part = addr)
+        a.Emit(0x48, 0x8D, 0x04, 0x37);                     // lea rax, [rdi+rsi]
+        a.Emit(0x48, 0x89, 0x45, 0x90);                     // mov [rbp-0x70], rax  (end)
 
-        // Ask what is at that address rather than guess. A range can be held without memory behind it,
-        // and the two cases need opposite calls, so the report is what decides. Its protection sits at
-        // offset 0x18 and the word saying what kind of range it is at 0x20; the whole report is 0x48
-        // bytes, which is what the call is told so it fills all of it.
-        a.Emit(0x48, 0x8B, 0x7D, 0xF8);                     // mov rdi, [rbp-8]
+        a.Mark("next");
+        a.Emit(0x48, 0x8B, 0x45, 0x98);                     // mov rax, [rbp-0x68]
+        a.Emit(0x48, 0x3B, 0x45, 0x90);                     // cmp rax, [rbp-0x70]
+        a.JumpIfAtOrAbove("after");
+        // Ask what is at this part. Its end sits at offset 8 of the report, its protection at 0x18 and
+        // the word saying what kind of range it is at 0x20; the whole report is 0x48 bytes.
+        a.Emit(0x48, 0x89, 0xC7);                           // mov rdi, rax
         a.Emit(0x31, 0xF6);                                 // xor esi, esi   (no search)
-        a.Emit(0x48, 0x8D, 0x55, 0xA0);                     // lea rdx, [rbp-96]
+        a.Emit(0x48, 0x8D, 0x55, 0xA0);                     // lea rdx, [rbp-0x60]
         a.Emit(0xB9, 0x48, 0x00, 0x00, 0x00);               // mov ecx, 0x48
         a.Call("sceKernelVirtualQuery");
-        // No report came back, so nothing here knows what that range is. The one thing that must not
-        // happen then is placing memory over it: a mapping pinned to an address replaces whatever was
-        // there, and if the range did hold something - this module's own image, say - it is gone and
-        // the fault lands somewhere else entirely. Ask for the protection change instead and let the
-        // platform refuse it if the range is not real.
-        a.Emit(0x85, 0xC0); a.JumpIfNotEqual("keepit");
-        // Two things have to agree before fresh memory is placed over a range, because placing it is
-        // destructive: a mapping pinned to an address replaces whatever was there, so misreading a live
-        // range as empty would throw away what it held - this module's own data, say, whose protection
-        // the runtime changes while it starts. A range whose addresses are merely held carries no
-        // protection at all *and* is none of the kinds that have something behind them. Anything else
-        // is left to the protection change, which is harmless when the guess is wrong either way.
-        a.Emit(0x8B, 0x45, 0xB8);                           // mov eax, [rbp-72]   (protection)
-        a.Emit(0x85, 0xC0); a.JumpIfNotEqual("keepit");     // test eax, eax
-        a.Emit(0x0F, 0xB6, 0x45, 0xC0);                     // movzbl [rbp-64], eax
+        // No report: nothing here knows what the rest is, so it is left to the protection change, which
+        // the platform refuses if the range is not real. Placing memory over it could destroy what it holds.
+        a.Emit(0x85, 0xC0); a.JumpIfNotEqual("unknown");    // test eax, eax
+        // The part ends where the report's range ends, but never past the requested end, and a report
+        // that does not move forward takes the rest in one go.
+        a.Emit(0x48, 0x8B, 0x45, 0xA8);                     // mov rax, [rbp-0x58]  (range end)
+        a.Emit(0x48, 0x3B, 0x45, 0x90);                     // cmp rax, [rbp-0x70]
+        a.JumpIfBelow("inside");
+        a.Emit(0x48, 0x8B, 0x45, 0x90);                     // mov rax, [rbp-0x70]
+        a.Mark("inside");
+        a.Emit(0x48, 0x3B, 0x45, 0x98);                     // cmp rax, [rbp-0x68]
+        a.JumpIfAbove("forward");
+        a.Emit(0x48, 0x8B, 0x45, 0x90);                     // mov rax, [rbp-0x70]
+        a.Mark("forward");
+        a.Emit(0x48, 0x89, 0x45, 0x88);                     // mov [rbp-0x78], rax  (part end)
+        // Held without memory behind it: no protection and none of the kinds that have something behind
+        // them. Anything else gets the protection change.
+        a.Emit(0x8B, 0x45, 0xB8);                           // mov eax, [rbp-0x48]  (protection)
+        a.Emit(0x85, 0xC0); a.JumpIfNotEqual("protect");    // test eax, eax
+        a.Emit(0x0F, 0xB6, 0x45, 0xC0);                     // movzx eax, byte [rbp-0x40]
         a.Emit(0xA8, RangeIsBacked);                        // test al, backed
-        a.JumpIfNotEqual("keepit");
-
-        // Nothing behind that range yet, so put memory behind it, pinned to the addresses that are
-        // already held. This is the step the protection call cannot do: that one reports success over a
-        // range that holds nothing and leaves it as empty as it found it, so the runtime believes it
-        // owns memory it has not been given and faults on the first write.
-        a.Emit(0x48, 0x8D, 0x7D, 0xF8);                     // lea rdi, [rbp-8]
-        a.Emit(0x48, 0x8B, 0x75, 0xF0);                     // mov rsi, [rbp-16]
+        a.JumpIfNotEqual("protect");
+        a.Emit(0x48, 0x8D, 0x7D, 0x98);                     // lea rdi, [rbp-0x68]
+        a.Emit(0x48, 0x8B, 0x75, 0x88);                     // mov rsi, [rbp-0x78]
+        a.Emit(0x48, 0x2B, 0x75, 0x98);                     // sub rsi, [rbp-0x68]
         a.Emit(0x8B, 0x55, 0xE8);                           // mov edx, [rbp-24]
         a.Emit(0xB9, MapFixed, 0x00, 0x00, 0x00);           // mov ecx, pinned
-        a.Emit(0x45, 0x31, 0xC0);                           // xor r8d, r8d  (read past the arguments)
+        a.Emit(0x45, 0x31, 0xC0);                           // xor r8d, r8d
         a.Call("sceKernelMapFlexibleMemory");
-        a.Emit(0x85, 0xC0); a.JumpIfEqual("done");          // test eax, eax
-        a.JumpIfAlways("refuse");
-
-        // Memory is already there, so this is a protection change on what it holds and nothing moves.
-        a.Mark("keepit");
-        a.Emit(0x48, 0x8B, 0x7D, 0xF8);                     // mov rdi, [rbp-8]
-        a.Emit(0x48, 0x8B, 0x75, 0xF0);                     // mov rsi, [rbp-16]
+        a.Emit(0x85, 0xC0); a.JumpIfNotEqual("refuse");     // test eax, eax
+        a.JumpIfAlways("advance");
+        a.Mark("protect");
+        a.Emit(0x48, 0x8B, 0x7D, 0x98);                     // mov rdi, [rbp-0x68]
+        a.Emit(0x48, 0x8B, 0x75, 0x88);                     // mov rsi, [rbp-0x78]
+        a.Emit(0x48, 0x29, 0xFE);                           // sub rsi, rdi
         a.Emit(0x8B, 0x55, 0xE8);                           // mov edx, [rbp-24]
         a.Call("sceKernelMprotect");
         a.Emit(0x85, 0xC0); a.JumpIfNotEqual("refuse");     // test eax, eax
+        a.Mark("advance");
+        a.Emit(0x48, 0x8B, 0x45, 0x88);                     // mov rax, [rbp-0x78]
+        a.Emit(0x48, 0x89, 0x45, 0x98);                     // mov [rbp-0x68], rax
+        a.JumpIfAlways("next");
+
+        a.Mark("unknown");
+        a.Emit(0x48, 0x8B, 0x7D, 0x98);                     // mov rdi, [rbp-0x68]
+        a.Emit(0x48, 0x8B, 0x75, 0x90);                     // mov rsi, [rbp-0x70]
+        a.Emit(0x48, 0x29, 0xFE);                           // sub rsi, rdi
+        a.Emit(0x8B, 0x55, 0xE8);                           // mov edx, [rbp-24]
+        a.Call("sceKernelMprotect");
+        a.Emit(0x85, 0xC0); a.JumpIfNotEqual("refuse");     // test eax, eax
+
+        // The page after the range, for read-write requests only, and only when it is held but empty.
+        // Its outcome does not change the answer: the requested range is already done.
+        a.Mark("after");
+        a.Emit(0x83, 0x7D, 0xE8, ProtReadWrite);            // cmp dword [rbp-24], read-write
+        a.JumpIfNotEqual("done");
+        a.Emit(0x48, 0x8B, 0x45, 0x90);                     // mov rax, [rbp-0x70]
+        a.Emit(0x48, 0x89, 0x45, 0x98);                     // mov [rbp-0x68], rax
+        a.Emit(0x48, 0x89, 0xC7);                           // mov rdi, rax
+        a.Emit(0x31, 0xF6);                                 // xor esi, esi
+        a.Emit(0x48, 0x8D, 0x55, 0xA0);                     // lea rdx, [rbp-0x60]
+        a.Emit(0xB9, 0x48, 0x00, 0x00, 0x00);               // mov ecx, 0x48
+        a.Call("sceKernelVirtualQuery");
+        a.Emit(0x85, 0xC0); a.JumpIfNotEqual("done");       // test eax, eax
+        a.Emit(0x8B, 0x45, 0xB8);                           // mov eax, [rbp-0x48]
+        a.Emit(0x85, 0xC0); a.JumpIfNotEqual("done");       // test eax, eax
+        a.Emit(0x0F, 0xB6, 0x45, 0xC0);                     // movzx eax, byte [rbp-0x40]
+        a.Emit(0xA8, RangeIsBacked);                        // test al, backed
+        a.JumpIfNotEqual("done");
+        a.Emit(0x48, 0x8D, 0x7D, 0x98);                     // lea rdi, [rbp-0x68]
+        a.Emit(0xBE, 0x00, 0x40, 0x00, 0x00);               // mov esi, page
+        a.Emit(0x8B, 0x55, 0xE8);                           // mov edx, [rbp-24]
+        a.Emit(0xB9, MapFixed, 0x00, 0x00, 0x00);           // mov ecx, pinned
+        a.Emit(0x45, 0x31, 0xC0);                           // xor r8d, r8d
+        a.Call("sceKernelMapFlexibleMemory");
         a.Mark("done");
         a.Emit(0x31, 0xC0, 0xC9, 0xC3);                     // xor eax, eax ; leave ; ret
-        // Whichever of the two calls refused, it answered a code carrying the reason, and neither
-        // leaves that reason where the runtime reads it.
+        // Whichever call refused, it answered a code carrying the reason, and neither leaves that reason
+        // where the runtime reads it.
         a.Mark("refuse");
         EmitCodedErrno(a);
         a.Emit(0xB8, 0xFF, 0xFF, 0xFF, 0xFF, 0xC9, 0xC3);   // mov eax, -1 ; leave ; ret
